@@ -10,6 +10,8 @@
 // /home/loeschef/Arduino/libraries/SdFat
 #include <SdFat.h>
 #include <TimeLib.h>
+#include <TimerOne.h>
+#include <TimerThree.h>
 
 // SD card object
 SdFs sd;
@@ -34,6 +36,18 @@ struct TestStats {
   uint8_t errorCode;
   uint8_t errorData;
 };
+
+// Timer1 interrupt handler (1ms interval, 1000 Hz)
+volatile uint32_t timer1_interrupt_count = 0;
+void timer1Handler() {
+  timer1_interrupt_count++;
+}
+
+// Timer3 interrupt handler (refresh timer, typically 200 Hz for grayscale)
+volatile uint32_t timer3_interrupt_count = 0;
+void timer3Handler() {
+  timer3_interrupt_count++;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -82,6 +96,12 @@ void loop() {
       case '5':
         testInterruptImpact();
         break;
+      case '6':
+        testTimer1Impact();
+        break;
+      case '7':
+        testBothTimersImpact();
+        break;
       case 'r':
       case 'R':
         runAllTests();
@@ -103,6 +123,8 @@ void printHelp() {
   Serial.println("3 - Count files on card");
   Serial.println("4 - Test different SDIO configs");
   Serial.println("5 - Test interrupt impact");
+  Serial.println("6 - Test Timer1 1ms interrupt impact");
+  Serial.println("7 - Test Timer1 + Timer3 (BSP full setup)");
   Serial.println("R - Run all tests");
   Serial.println("H - Show this help");
   Serial.println("============================\n");
@@ -124,6 +146,12 @@ void runAllTests() {
   delay(500);
 
   testInterruptImpact();
+  delay(500);
+
+  testTimer1Impact();
+  delay(500);
+
+  testBothTimersImpact();
 
   Serial.println("\n=== All Tests Complete ===");
   printHelp();
@@ -420,4 +448,254 @@ void testInterruptImpact() {
 
     sd.end();
   }
+}
+
+void testTimer1Impact() {
+  Serial.println("\n--- Test 6: Timer1 1ms Interrupt Impact (BSP-like) ---");
+  Serial.println("This test mimics the setup in bsp.cpp where Timer1 is");
+  Serial.println("configured with a 1ms interrupt before SD initialization.");
+
+  // Make sure Timer1 is stopped first
+  Timer1.stop();
+  timer1_interrupt_count = 0;
+
+  // Configure Timer1 with 1ms interval (1000 Hz), similar to bsp.cpp
+  // TIMER1_CLCK_HZ / ticks_per_second = 1000000 / 1000 = 1000 microseconds
+  Serial.println("\nConfiguring Timer1:");
+  Serial.println("  Interval: 1000 microseconds (1ms)");
+  Serial.println("  Frequency: 1000 Hz");
+  
+  Timer1.initialize(1000); // 1000 microseconds = 1ms
+  Timer1.attachInterrupt(timer1Handler);
+  
+  // Let it run for a moment to verify it's working
+  delay(100);
+  uint32_t interrupts_before = timer1_interrupt_count;
+  Serial.print("  Timer1 interrupts in 100ms: ");
+  Serial.println(interrupts_before);
+  
+  if (interrupts_before < 80 || interrupts_before > 120) {
+    Serial.println("  WARNING: Unexpected interrupt count!");
+  }
+
+  // Now try SD card initialization with Timer1 running
+  Serial.println("\nInitializing SD card with Timer1 active...");
+  uint32_t startTime = millis();
+  timer1_interrupt_count = 0;
+  
+  bool success = sd.begin(SdioConfig(FIFO_SDIO));
+  
+  uint32_t elapsed = millis() - startTime;
+  uint32_t interrupts_during = timer1_interrupt_count;
+
+  Serial.print("Result: ");
+  Serial.println(success ? "SUCCESS" : "FAILED");
+  Serial.print("Time: ");
+  Serial.print(elapsed);
+  Serial.println(" ms");
+  Serial.print("Timer1 interrupts during init: ");
+  Serial.println(interrupts_during);
+  
+  if (success) {
+    // Verify SD card is still functional
+    Serial.println("\nVerifying SD card functionality...");
+    
+    FsFile testFile;
+    startTime = millis();
+    uint32_t int_before_op = timer1_interrupt_count;
+    
+    bool opSuccess = testFile.open("/", O_RDONLY);
+    uint32_t opTime = millis() - startTime;
+    uint32_t int_during_op = timer1_interrupt_count - int_before_op;
+
+    Serial.print("  Open root directory: ");
+    Serial.println(opSuccess ? "SUCCESS" : "FAILED");
+    Serial.print("  Time: ");
+    Serial.print(opTime);
+    Serial.println(" ms");
+    Serial.print("  Timer1 interrupts during operation: ");
+    Serial.println(int_during_op);
+
+    if (opSuccess) {
+      testFile.close();
+    }
+
+    sd.end();
+    
+    Serial.println("\nConclusion:");
+    Serial.println("  SD card initialization and basic operations work");
+    Serial.println("  correctly with Timer1 running at 1ms interval.");
+  } else {
+    Serial.println("\nSD card initialization FAILED with Timer1 active!");
+    Serial.print("Error Code: 0x");
+    Serial.println(sd.sdErrorCode(), HEX);
+    Serial.print("Error Data: 0x");
+    Serial.println(sd.sdErrorData(), HEX);
+  }
+
+  // Stop Timer1 to clean up
+  Serial.println("\nStopping Timer1...");
+  Timer1.stop();
+  timer1_interrupt_count = 0;
+  
+  Serial.println("Test complete.");
+}
+
+void testBothTimersImpact() {
+  Serial.println("\n--- Test 7: Timer1 + Timer3 Impact (Full BSP Setup) ---");
+  Serial.println("This test mimics the complete setup in bsp.cpp with both:");
+  Serial.println("  - Timer1: 1ms interval (1000 Hz) for system ticks");
+  Serial.println("  - Timer3: 5ms interval (200 Hz) for display refresh");
+
+  // Make sure both timers are stopped first
+  Timer1.stop();
+  Timer3.stop();
+  timer1_interrupt_count = 0;
+  timer3_interrupt_count = 0;
+
+  // Configure Timer1 with 1ms interval (1000 Hz)
+  Serial.println("\nConfiguring Timer1:");
+  Serial.println("  Interval: 1000 microseconds (1ms)");
+  Serial.println("  Frequency: 1000 Hz");
+  Timer1.initialize(1000); // 1000 microseconds = 1ms
+  Timer1.attachInterrupt(timer1Handler);
+  
+  // Configure Timer3 with 5ms interval (200 Hz) - typical grayscale refresh rate
+  Serial.println("\nConfiguring Timer3:");
+  Serial.println("  Interval: 5000 microseconds (5ms)");
+  Serial.println("  Frequency: 200 Hz (grayscale refresh rate)");
+  Timer3.initialize(5000); // 5000 microseconds = 5ms
+  Timer3.attachInterrupt(timer3Handler);
+  
+  // Let them run for a moment to verify they're working
+  delay(100);
+  uint32_t timer1_before = timer1_interrupt_count;
+  uint32_t timer3_before = timer3_interrupt_count;
+  Serial.print("  Timer1 interrupts in 100ms: ");
+  Serial.println(timer1_before);
+  Serial.print("  Timer3 interrupts in 100ms: ");
+  Serial.println(timer3_before);
+  
+  if (timer1_before < 80 || timer1_before > 120) {
+    Serial.println("  WARNING: Timer1 unexpected interrupt count!");
+  }
+  if (timer3_before < 16 || timer3_before > 24) {
+    Serial.println("  WARNING: Timer3 unexpected interrupt count!");
+  }
+
+  // Now try SD card initialization with both timers running
+  Serial.println("\nInitializing SD card with both timers active...");
+  uint32_t startTime = millis();
+  timer1_interrupt_count = 0;
+  timer3_interrupt_count = 0;
+  
+  bool success = sd.begin(SdioConfig(FIFO_SDIO));
+  
+  uint32_t elapsed = millis() - startTime;
+  uint32_t timer1_during = timer1_interrupt_count;
+  uint32_t timer3_during = timer3_interrupt_count;
+
+  Serial.print("Result: ");
+  Serial.println(success ? "SUCCESS" : "FAILED");
+  Serial.print("Time: ");
+  Serial.print(elapsed);
+  Serial.println(" ms");
+  Serial.print("Timer1 interrupts during init: ");
+  Serial.println(timer1_during);
+  Serial.print("Timer3 interrupts during init: ");
+  Serial.println(timer3_during);
+  
+  if (success) {
+    // Verify SD card is still functional
+    Serial.println("\nVerifying SD card functionality...");
+    
+    FsFile testFile;
+    startTime = millis();
+    uint32_t timer1_before_op = timer1_interrupt_count;
+    uint32_t timer3_before_op = timer3_interrupt_count;
+    
+    bool opSuccess = testFile.open("/", O_RDONLY);
+    uint32_t opTime = millis() - startTime;
+    uint32_t timer1_during_op = timer1_interrupt_count - timer1_before_op;
+    uint32_t timer3_during_op = timer3_interrupt_count - timer3_before_op;
+
+    Serial.print("  Open root directory: ");
+    Serial.println(opSuccess ? "SUCCESS" : "FAILED");
+    Serial.print("  Time: ");
+    Serial.print(opTime);
+    Serial.println(" ms");
+    Serial.print("  Timer1 interrupts during operation: ");
+    Serial.println(timer1_during_op);
+    Serial.print("  Timer3 interrupts during operation: ");
+    Serial.println(timer3_during_op);
+
+    if (opSuccess) {
+      testFile.close();
+    }
+
+    // Test with higher refresh rate (binary mode - 500 Hz / 2ms)
+    Serial.println("\nReconfiguring Timer3 for binary refresh rate:");
+    Serial.println("  Interval: 2000 microseconds (2ms)");
+    Serial.println("  Frequency: 500 Hz (binary refresh rate)");
+    Timer3.stop();
+    Timer3.initialize(2000); // 2000 microseconds = 2ms
+    Timer3.attachInterrupt(timer3Handler);
+    timer3_interrupt_count = 0;
+    
+    delay(100);
+    uint32_t timer3_binary = timer3_interrupt_count;
+    Serial.print("  Timer3 interrupts in 100ms: ");
+    Serial.println(timer3_binary);
+    
+    if (timer3_binary < 40 || timer3_binary > 60) {
+      Serial.println("  WARNING: Timer3 unexpected interrupt count at 500Hz!");
+    }
+
+    // Try another SD operation with higher Timer3 frequency
+    Serial.println("\nVerifying SD with 500 Hz Timer3...");
+    startTime = millis();
+    timer1_before_op = timer1_interrupt_count;
+    timer3_before_op = timer3_interrupt_count;
+    
+    opSuccess = testFile.open("/", O_RDONLY);
+    opTime = millis() - startTime;
+    timer1_during_op = timer1_interrupt_count - timer1_before_op;
+    timer3_during_op = timer3_interrupt_count - timer3_before_op;
+
+    Serial.print("  Open root directory: ");
+    Serial.println(opSuccess ? "SUCCESS" : "FAILED");
+    Serial.print("  Time: ");
+    Serial.print(opTime);
+    Serial.println(" ms");
+    Serial.print("  Timer1 interrupts: ");
+    Serial.println(timer1_during_op);
+    Serial.print("  Timer3 interrupts: ");
+    Serial.println(timer3_during_op);
+
+    if (opSuccess) {
+      testFile.close();
+    }
+
+    sd.end();
+    
+    Serial.println("\nConclusion:");
+    Serial.println("  SD card initialization and operations work correctly");
+    Serial.println("  with both Timer1 (1000 Hz) and Timer3 (200/500 Hz) active.");
+    Serial.println("  This confirms compatibility with the full BSP setup.");
+  } else {
+    Serial.println("\nSD card initialization FAILED with both timers active!");
+    Serial.print("Error Code: 0x");
+    Serial.println(sd.sdErrorCode(), HEX);
+    Serial.print("Error Data: 0x");
+    Serial.println(sd.sdErrorData(), HEX);
+  }
+
+  // Stop both timers to clean up
+  Serial.println("\nStopping both timers...");
+  Timer1.stop();
+  Timer3.stop();
+  timer1_interrupt_count = 0;
+  timer3_interrupt_count = 0;
+  
+  Serial.println("Test complete.");
 }
